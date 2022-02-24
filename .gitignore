@@ -1,1 +1,6 @@
 .DS_Store
+binance
+.gitignore
+pancakeswap
+pcs-scripts/node_modules
+pcs-scripts/package-lock.json
