@@ -5,7 +5,7 @@ const colors = {
 }
 
 const logColor = (color, content) => {
-    console.log(colors[color], content)
+    console.log(color, content)
 }
 
 const log = (content) => {
