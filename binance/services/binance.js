@@ -1,8 +1,10 @@
-const Binance = require('node-binance-api')
-const client = new Binance().options({
-    APIKEY: process.env.APIKEY,
-    APISECRET: process.env.SECRET,
-    useServerTime: true
+const Binance = require('binance-api-node').default
+
+const client = Binance({
+    apiKey: process.env.APIKEY,
+    apiSecret: process.env.SECRET,
+    getTime: () => Date.now(),
 })
 
 module.exports = client
+

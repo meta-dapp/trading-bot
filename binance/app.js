@@ -1,5 +1,6 @@
 require('dotenv').config()
 const Storage = require('node-storage')
+const fs = require('fs')
 const moment = require('moment')
 const { log, logColor, colors } = require('./utils/logger')
 const client = require('./services/binance')
@@ -11,11 +12,6 @@ const BUY_ORDER_AMOUNT = process.argv[4]
 
 const store = new Storage(`./data/${MARKET}.json`)
 const sleep = (timeMs) => new Promise(resolve => setTimeout(resolve, timeMs))
-
-async function _balances() {
-    await client.useServerTime()
-    return await client.balance()
-}
 
 function elapsedTime() {
     const diff = Date.now() - store.get('start_time')
@@ -29,9 +25,9 @@ function _newPriceReset(_market, balance, price) {
 }
 
 async function _updateBalances() {
-    const balances = await _balances()
-    store.put(`${MARKET1.toLowerCase()}_balance`, parseFloat(balances[MARKET1].available))
-    store.put(`${MARKET2.toLowerCase()}_balance`, parseFloat(balances[MARKET2].available))
+    const balances = await getBalances()
+    store.put(`${MARKET1.toLowerCase()}_balance`, balances[MARKET1])
+    store.put(`${MARKET2.toLowerCase()}_balance`, balances[MARKET2])
 }
 
 async function _calculateProfits() {
@@ -47,6 +43,16 @@ async function _calculateProfits() {
     store.put('profits', totalSoldProfits + parseFloat(store.get('profits')))
 }
 
+function getRealProfits(price) {
+    const m1Balance = parseFloat(store.get(`${MARKET1.toLowerCase()}_balance`))
+    const m2Balance = parseFloat(store.get(`${MARKET2.toLowerCase()}_balance`))
+
+    const initialBalance1 = parseFloat(store.get(`initial_${MARKET1.toLowerCase()}_balance`))
+    const initialBalance2 = parseFloat(store.get(`initial_${MARKET2.toLowerCase()}_balance`))
+
+    return parseFloat(parseFloat((m1Balance - initialBalance1) * price + m2Balance) - initialBalance2).toFixed(4)
+}
+
 function _logProfits(price) {
     const profits = parseFloat(store.get('profits'))
     var isGainerProfit = profits > 0 ?
@@ -55,52 +61,52 @@ function _logProfits(price) {
     logColor(isGainerProfit == 1 ?
         colors.green : isGainerProfit == 2 ?
             colors.red : colors.gray,
-        `Global Profits (Incl. fees): ${parseFloat(store.get('profits')).toFixed(4)} ${MARKET2}`)
-    log(`Global Fees: ${parseFloat(store.get('fees')).toFixed(4)} ${MARKET2}`)
+        `Grid Profits (Incl. fees): ${parseFloat(store.get('profits')).toFixed(4)} ${MARKET2}`)
 
     const m1Balance = parseFloat(store.get(`${MARKET1.toLowerCase()}_balance`))
     const m2Balance = parseFloat(store.get(`${MARKET2.toLowerCase()}_balance`))
 
     const initialBalance = parseFloat(store.get(`initial_${MARKET2.toLowerCase()}_balance`))
+
     logColor(colors.gray,
         `Balance: ${m1Balance} ${MARKET1}, ${m2Balance.toFixed(2)} ${MARKET2}`)
     logColor(colors.gray,
-        `Current: ${parseFloat(m1Balance * price + m2Balance)} ${MARKET2}, Initial: ${initialBalance.toFixed(2)} ${MARKET2}`)
+        `Current: ${parseFloat(m1Balance * price + m2Balance).toFixed(2)} ${MARKET2}, Initial: ${initialBalance.toFixed(2)} ${MARKET2}`)
 }
 
 async function getFees({ commission, commissionAsset }) {
     const market = `${commissionAsset}USDT`
-    const price = parseFloat((await client.prices(market))[market])
+    const price = await getPrice(market)
     return price * commission
 }
 
 async function _buy(price, amount) {
-    if (parseFloat(store.get(`${MARKET2.toLowerCase()}_balance`)) >= BUY_ORDER_AMOUNT * price) {
+    if (parseFloat(store.get(`${MARKET2.toLowerCase()}_balance`)) >= BUY_ORDER_AMOUNT) {
         var orders = store.get('orders')
         var factor = process.env.PRICE_PERCENT * price / 100
 
         const order = {
             buy_price: price,
-            amount,
             sell_price: price + factor,
             sold_price: 0,
             status: 'pending',
             profit: 0,
             buy_fee: 0,
-            sell_fee: 0
+            sell_fee: 0,
         }
 
         log(`
             Buying ${MARKET1}
             ==================
-            amountIn: ${parseFloat(BUY_ORDER_AMOUNT * price).toFixed(2)} ${MARKET2}
-            amountOut: ${BUY_ORDER_AMOUNT} ${MARKET1}
+            amountIn: ${parseFloat(BUY_ORDER_AMOUNT).toFixed(2)} ${MARKET2}
+            amountOut: ${BUY_ORDER_AMOUNT / price} ${MARKET1}
         `)
 
-        const res = await client.marketBuy(MARKET, order.amount)
+        const res = await marketBuy(amount, true)
         if (res && res.status === 'FILLED') {
             order.status = 'bought'
             order.id = res.orderId
+            order.amount = res.fills[0].qty
             order.buy_fee = parseFloat((await getFees(res.fills[0])))
             store.put('fees', parseFloat(store.get('fees')) + order.buy_fee)
             order.buy_price = parseFloat(res.fills[0].price)
@@ -116,6 +122,80 @@ async function _buy(price, amount) {
             await _calculateProfits()
         } else _newPriceReset(2, BUY_ORDER_AMOUNT * price, price)
     } else _newPriceReset(2, BUY_ORDER_AMOUNT * price, price)
+}
+
+async function marketBuy(amount, quoted) {
+    return await marketOrder('BUY', amount, quoted)
+}
+
+async function marketOrder(side, amount, quoted) {
+    const orderObject = {
+        symbol: MARKET,
+        side: side,
+        type: 'MARKET',
+    }
+
+    if (quoted)
+        orderObject['quoteOrderQty'] = amount
+    else
+        orderObject['quantity'] = amount
+
+    return await client.order(orderObject)
+}
+
+async function marketSell(amount) {
+    return await marketOrder('SELL', amount)
+}
+
+async function clearStart() {
+    await _closeBot()
+    const balances = await getBalances()
+    const totalAmount = balances[MARKET1]
+    const price = await getPrice(MARKET)
+    const minSell = (await getMinBuy()) / price
+    if (totalAmount >= parseFloat(minSell)) {
+        try {
+            const lotQuantity = await getQuantity(totalAmount)
+            const res = await marketSell(lotQuantity)
+            if (res && res.status === 'FILLED') {
+                logColor(colors.green, 'Iniciando en modo limpio...')
+                await sleep(3000)
+            } else {
+                logFail()
+            }
+        } catch (err) {
+            logFail()
+        }
+    }
+}
+
+function logFail() {
+    logColor(colors.red, 'No se ha podido vender el saldo inicial.')
+    logColor(colors.red, 'Debes venderlo manualmente en Binance.')
+    process.exit()
+}
+
+async function _sellAll() {
+    await sleep(3000)
+    const balances = await getBalances()
+    const totalAmount = balances[MARKET1]
+    if (totalAmount > 0) {
+        try {
+            const lotQuantity = await getQuantity(totalAmount)
+            const res = await marketSell(lotQuantity)
+            if (res && res.status === 'FILLED') {
+                logColor(colors.green, 'Bot detenido correctamente: Todo vendido')
+            } else {
+                logFail()
+            }
+        } catch (err) { }
+    }
+}
+
+async function _closeBot() {
+    try {
+        fs.unlinkSync(`./data/${MARKET}.json`)
+    } catch (ee) { }
 }
 
 async function _sell(price) {
@@ -141,7 +221,8 @@ async function _sell(price) {
                 amountOut: ${parseFloat(totalAmount * price).toFixed(2)} ${MARKET2}
             `)
 
-            const res = await client.marketSell(MARKET, totalAmount)
+            const lotQuantity = await getQuantity(totalAmount)
+            const res = await marketSell(lotQuantity)
             if (res && res.status === 'FILLED') {
                 const _price = parseFloat(res.fills[0].price)
 
@@ -183,7 +264,7 @@ async function _sell(price) {
 async function broadcast() {
     while (true) {
         try {
-            const mPrice = parseFloat((await client.prices(MARKET))[MARKET])
+            const mPrice = await getPrice(MARKET)
             if (mPrice) {
                 const startPrice = store.get('start_price')
                 const marketPrice = mPrice
@@ -192,17 +273,35 @@ async function broadcast() {
 
                 log(`Running Time: ${elapsedTime()}`)
                 log('===========================================================')
+                const totalProfitsPercent = parseFloat(
+                    100 * getRealProfits(marketPrice) / store.get(`initial_${MARKET2.toLowerCase()}_balance`)
+                ).toFixed(3)
+                log(`Real Profits [SL = ${process.env.STOP_LOSS_BOT}%, TP = ${process.env.TAKE_PROFIT_BOT}%]: ${totalProfitsPercent}%`)
+
+                if (totalProfitsPercent >= process.env.TAKE_PROFIT_BOT) {
+                    logColor(colors.green, 'Cerrando bot en ganancias....')
+                    if (process.env.SELL_ALL_ON_CLOSE)
+                        await _sellAll()
+                    await _closeBot()
+                    return
+                } else if (totalProfitsPercent <= -1 * process.env.STOP_LOSS_BOT) {
+                    logColor(colors.red, 'Cerrando bot en pérdidas....')
+                    if (process.env.SELL_ALL_ON_CLOSE)
+                        await _sellAll()
+                    await _closeBot()
+                    return
+                }
                 _logProfits(marketPrice)
                 log('===========================================================')
 
-                log(`Prev price: ${startPrice}`)
-                log(`New price: ${marketPrice}`)
+                log(`Prev price: ${startPrice} ${MARKET2}`)
+                log(`New price: ${marketPrice} ${MARKET2}`)
 
                 if (marketPrice < startPrice) {
                     var factor = (startPrice - marketPrice)
                     var percent = parseFloat(100 * factor / startPrice).toFixed(2)
 
-                    logColor(colors.red, `Losers: -${parseFloat(percent).toFixed(3)}% ==> -$${parseFloat(factor).toFixed(4)}`)
+                    logColor(colors.red, `Losers: -${parseFloat(percent).toFixed(3)}% ==> -${parseFloat(factor).toFixed(4)} ${MARKET2}`)
                     store.put('percent', `-${parseFloat(percent).toFixed(3)}`)
 
                     if (percent >= process.env.PRICE_PERCENT)
@@ -211,7 +310,7 @@ async function broadcast() {
                     const factor = (marketPrice - startPrice)
                     const percent = 100 * factor / marketPrice
 
-                    logColor(colors.green, `Gainers: +${parseFloat(percent).toFixed(3)}% ==> +$${parseFloat(factor).toFixed(4)}`)
+                    logColor(colors.green, `Gainers: +${parseFloat(percent).toFixed(3)}% ==> +${parseFloat(factor).toFixed(4)} ${MARKET2}`)
                     store.put('percent', `+${parseFloat(percent).toFixed(3)}`)
 
                     await _sell(marketPrice)
@@ -223,9 +322,15 @@ async function broadcast() {
                     console.log()
                     log('Last buy order')
                     console.log('==========================')
-                    log(`Buy price: ${bOrder.buy_price}`)
-                    log(`Sell price: ${bOrder.sell_price}`)
-                    logColor(colors.green, `Expected profit: ${parseFloat((bOrder.amount * bOrder.sell_price - bOrder.amount * bOrder.buy_price) - bOrder.buy_fee).toFixed(2)}`)
+                    log(`Buy price: ${bOrder.buy_price} ${MARKET2}`)
+                    log(`Sell price: ${bOrder.sell_price} ${MARKET2}`)
+                    log(`Order amount: ${BUY_ORDER_AMOUNT} ${MARKET2}`)
+                    const expectedProfits = parseFloat((bOrder.amount * bOrder.sell_price - bOrder.amount * bOrder.buy_price) - bOrder.buy_fee).toFixed(3)
+                    if (expectedProfits >= 0)
+                        logColor(colors.green, `Expected profit: +${expectedProfits} ${MARKET2}`)
+                    else
+                        logColor(colors.red, `Expected profit: ${expectedProfits} ${MARKET2}`)
+
                     console.log('==========================')
                 }
             }
@@ -234,18 +339,62 @@ async function broadcast() {
     }
 }
 
+
+const getBalances = async () => {
+    const assets = [MARKET1, MARKET2]
+    const { balances } = await client.accountInfo()
+    const _balances = balances.filter(coin => assets.includes(coin.asset))
+    var parsedBalnaces = {}
+    assets.forEach(asset => {
+        parsedBalnaces[asset] = parseFloat(_balances.find(coin => coin.asset === asset).free)
+    })
+    return parsedBalnaces
+}
+
+const getPrice = async (symbol) => {
+    return parseFloat((await client.prices({ symbol }))[symbol])
+}
+
+const getQuantity = async (amount) => {
+    const { symbols } = await client.exchangeInfo({ symbol: MARKET })
+    const { stepSize } = symbols[0].filters.find(filter => filter.filterType === 'LOT_SIZE')
+    let quantity = (amount / stepSize).toFixed(symbols[0].baseAssetPrecision)
+
+    if (amount % stepSize !== 0) {
+        quantity = (parseInt(quantity) * stepSize).toFixed(symbols[0].baseAssetPrecision)
+    }
+
+    return quantity
+}
+
+async function getMinBuy() {
+    const { symbols } = await client.exchangeInfo({ symbol: MARKET })
+    const { minNotional } = symbols[0].filters.find(filter => filter.filterType === 'MIN_NOTIONAL')
+
+    return parseFloat(minNotional)
+}
+
 async function init() {
+    const minBuy = await getMinBuy()
+    if (minBuy > BUY_ORDER_AMOUNT) {
+        console.log(`El lote mínimo de compra es: ${minBuy} ${MARKET2}`)
+        return
+    }
+
     if (process.argv[5] !== 'resume') {
+        log('Iniciando bot...')
+        if (process.env.SELL_ALL_ON_START)
+            await clearStart()
         const startTime = Date.now()
         store.put('start_time', startTime)
-        const price = await client.prices(MARKET)
-        store.put('start_price', parseFloat(price[MARKET]))
+        const price = await getPrice(MARKET)
+        store.put('start_price', price)
         store.put('orders', [])
         store.put('profits', 0)
         store.put('fees', 0)
-        const balances = await _balances()
-        store.put(`${MARKET1.toLowerCase()}_balance`, parseFloat(balances[MARKET1].available))
-        store.put(`${MARKET2.toLowerCase()}_balance`, parseFloat(balances[MARKET2].available))
+        const balances = await getBalances()
+        store.put(`${MARKET1.toLowerCase()}_balance`, balances[MARKET1])
+        store.put(`${MARKET2.toLowerCase()}_balance`, balances[MARKET2])
         store.put(`initial_${MARKET1.toLowerCase()}_balance`, store.get(`${MARKET1.toLowerCase()}_balance`))
         store.put(`initial_${MARKET2.toLowerCase()}_balance`, store.get(`${MARKET2.toLowerCase()}_balance`))
     }
