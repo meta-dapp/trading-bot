@@ -4,6 +4,7 @@ const fs = require('fs')
 const moment = require('moment')
 const { log, logColor, colors } = require('./utils/logger')
 const client = require('./services/binance')
+const { NotifyTelegram } = require('./services/TelegramNotify')
 
 const MARKET1 = process.argv[2]
 const MARKET2 = process.argv[3]
@@ -15,7 +16,9 @@ const sleep = (timeMs) => new Promise(resolve => setTimeout(resolve, timeMs))
 
 function elapsedTime() {
     const diff = Date.now() - store.get('start_time')
-    return moment.utc(diff).format('HH:mm:ss')
+    var diffDays = diff / 86400000
+    diffDays = diffDays < 1 ? '' : diffDays
+    return diffDays + '' + moment.utc(diff).format('HH:mm:ss')
 }
 
 function _newPriceReset(_market, balance, price) {
@@ -75,19 +78,21 @@ function _logProfits(price) {
 }
 
 async function getFees({ commission, commissionAsset }) {
-    const market = `${commissionAsset}USDT`
-    const price = await getPrice(market)
+    if (commissionAsset === MARKET2) return commission
+    const price = await getPrice(MARKET)
     return price * commission
 }
 
 async function _buy(price, amount) {
     if (parseFloat(store.get(`${MARKET2.toLowerCase()}_balance`)) >= BUY_ORDER_AMOUNT) {
         var orders = store.get('orders')
-        var factor = process.env.PRICE_PERCENT * price / 100
+        var sellFactor = process.env.SELL_PERCENT * price / 100
+        var slFactor = process.env.STOP_LOSS_GRID * price / 100
 
         const order = {
             buy_price: price,
-            sell_price: price + factor,
+            sell_price: price + sellFactor,
+            sl_price: price - slFactor,
             sold_price: 0,
             status: 'pending',
             profit: 0,
@@ -106,8 +111,8 @@ async function _buy(price, amount) {
         if (res && res.status === 'FILLED') {
             order.status = 'bought'
             order.id = res.orderId
-            order.amount = res.fills[0].qty
             order.buy_fee = parseFloat((await getFees(res.fills[0])))
+            order.amount = res.fills[0].qty - res.fills[0].commission
             store.put('fees', parseFloat(store.get('fees')) + order.buy_fee)
             order.buy_price = parseFloat(res.fills[0].price)
 
@@ -116,12 +121,37 @@ async function _buy(price, amount) {
             await _updateBalances()
 
             logColor(colors.green, '=============================')
-            logColor(colors.green, `Bought ${BUY_ORDER_AMOUNT} ${MARKET1} for ${parseFloat(BUY_ORDER_AMOUNT * price).toFixed(2)} ${MARKET2}, Price: ${order.buy_price}\n`)
+            logColor(colors.green, `Bought ${order.amount} ${MARKET1} for ${parseFloat(BUY_ORDER_AMOUNT).toFixed(2)} ${MARKET2}, Price: ${order.buy_price}\n`)
             logColor(colors.green, '=============================')
 
             await _calculateProfits()
-        } else _newPriceReset(2, BUY_ORDER_AMOUNT * price, price)
-    } else _newPriceReset(2, BUY_ORDER_AMOUNT * price, price)
+
+            _notifyTelegram(price, 'buy')
+        } else _newPriceReset(2, BUY_ORDER_AMOUNT, price)
+    } else _newPriceReset(2, BUY_ORDER_AMOUNT, price)
+}
+
+function canNotifyTelegram(from) {
+    return process.env.NOTIFY_TELEGRAM_ON.includes(from)
+}
+
+function _notifyTelegram(price, from) {
+    moment.locale('es')
+    if (process.env.NOTIFY_TELEGRAM
+        && canNotifyTelegram(from))
+        NotifyTelegram({
+            runningTime: elapsedTime(),
+            market: MARKET,
+            market1: MARKET1,
+            market2: MARKET2,
+            price: price,
+            balance1: store.get(`${MARKET1.toLowerCase()}_balance`),
+            balance2: store.get(`${MARKET2.toLowerCase()}_balance`),
+            gridProfits: parseFloat(store.get('profits')).toFixed(4),
+            realProfits: getRealProfits(price),
+            start: moment(store.get('start_time')).format('DD/MM/YYYY HH:mm'),
+            from
+        })
 }
 
 async function marketBuy(amount, quoted) {
@@ -198,22 +228,45 @@ async function _closeBot() {
     } catch (ee) { }
 }
 
-async function _sell(price) {
+function getOrderId() {
+    const fifoStrategy = process.env.STOP_LOSS_GRID_IS_FIFO
+    const orders = store.get('orders')
+    const index = fifoStrategy ? 0 : orders.length - 1
+
+    return store.get('orders')[index].id
+}
+
+function getToSold(price, changeStatus) {
     const orders = store.get('orders')
     const toSold = []
 
     for (var i = 0; i < orders.length; i++) {
         var order = orders[i]
-        if (price >= order.sell_price) {
-            order.sold_price = price
-            order.status = 'selling'
+        if (price >= order.sell_price ||
+            (process.env.USE_STOP_LOSS_GRID
+                && getOrderId() === order.id
+                && store.get(`${MARKET2.toLowerCase()}_balance`) < BUY_ORDER_AMOUNT
+                && price < order.sl_price)) {
+            if (changeStatus) {
+                order.sold_price = price
+                order.status = 'selling'
+            }
             toSold.push(order)
         }
     }
 
+    return toSold
+}
+
+async function _sell(price) {
+    const orders = store.get('orders')
+    const toSold = getToSold(price, true)
+
     if (toSold.length > 0) {
-        const totalAmount = parseFloat(toSold.map(order => order.amount).reduce((prev, next) => parseFloat(prev) + parseFloat(next)))
-        if (totalAmount > 0 && parseFloat(store.get(`${MARKET1.toLowerCase()}_balance`)) >= totalAmount) {
+        var totalAmount = parseFloat(toSold.map(order => order.amount).reduce((prev, next) => parseFloat(prev) + parseFloat(next)))
+        const balance = parseFloat(store.get(`${MARKET1.toLowerCase()}_balance`))
+        totalAmount = totalAmount > balance ? balance : totalAmount
+        if (totalAmount > 0) {
             log(`
                 Selling ${MARKET1}
                 =================
@@ -238,6 +291,7 @@ async function _sell(price) {
                             toSold[j].status = 'sold'
                             orders[i] = toSold[j]
                             store.put('fees', parseFloat(store.get('fees')) + orders[i].sell_fee)
+                            store.put('sl_losses', parseFloat(store.get('sl_losses')) + orders[i].profit)
                         }
                     }
                 }
@@ -256,9 +310,13 @@ async function _sell(price) {
                 while (i--)
                     if (orders[i].status === 'sold')
                         orders.splice(i, 1)
+
+                _notifyTelegram(price, 'sell')
             } else store.put('start_price', price)
         } else store.put('start_price', price)
-    } else store.put('start_price', price)
+    }
+
+    return toSold.length > 0
 }
 
 async function broadcast() {
@@ -270,51 +328,82 @@ async function broadcast() {
                 const marketPrice = mPrice
 
                 console.clear()
-
                 log(`Running Time: ${elapsedTime()}`)
                 log('===========================================================')
-                const totalProfitsPercent = parseFloat(
-                    100 * getRealProfits(marketPrice) / store.get(`initial_${MARKET2.toLowerCase()}_balance`)
-                ).toFixed(3)
-                log(`Real Profits [SL = ${process.env.STOP_LOSS_BOT}%, TP = ${process.env.TAKE_PROFIT_BOT}%]: ${totalProfitsPercent}%`)
+                const totalProfits = getRealProfits(marketPrice)
 
-                if (totalProfitsPercent >= process.env.TAKE_PROFIT_BOT) {
-                    logColor(colors.green, 'Cerrando bot en ganancias....')
-                    if (process.env.SELL_ALL_ON_CLOSE)
-                        await _sellAll()
-                    await _closeBot()
-                    return
-                } else if (totalProfitsPercent <= -1 * process.env.STOP_LOSS_BOT) {
-                    logColor(colors.red, 'Cerrando bot en pérdidas....')
-                    if (process.env.SELL_ALL_ON_CLOSE)
-                        await _sellAll()
-                    await _closeBot()
-                    return
+                if (!isNaN(totalProfits)) {
+                    const totalProfitsPercent = parseFloat(
+                        100 * totalProfits / store.get(`initial_${MARKET2.toLowerCase()}_balance`)
+                    ).toFixed(3)
+                    log(`Withdrawal profits: ${parseFloat(store.get('withdrawal_profits')).toFixed(2)} ${MARKET2}`)
+                    logColor(totalProfits < 0 ? colors.red : totalProfits == 0 ? colors.gray : colors.green,
+                        `Real Profits [SL = ${process.env.STOP_LOSS_BOT}%, TP = ${process.env.TAKE_PROFIT_BOT}%]: ${totalProfitsPercent}% ==> ${totalProfits <= 0 ? '' : '+'}${parseFloat(totalProfits).toFixed(3)} ${MARKET2}`)
+
+                    if (totalProfitsPercent >= parseFloat(process.env.TAKE_PROFIT_BOT)) {
+                        logColor(colors.green, 'Cerrando bot en ganancias....')
+                        if (process.env.SELL_ALL_ON_CLOSE) {
+                            if (process.env.WITHDRAW_PROFITS
+                                && totalProfits >= parseFloat(process.env.MIN_WITHDRAW_AMOUNT)) {
+                                await withdraw(totalProfits, marketPrice)
+                                if (process.env.START_AGAIN) {
+                                    await sleep(5000)
+                                    await _updateBalances()
+                                } else {
+                                    await _closeBot()
+                                    return
+                                }
+                            } else {
+                                await _sellAll()
+                                await _closeBot()
+
+                                return
+                            }
+                        } else {
+                            return
+                        }
+                    } else if (totalProfitsPercent <= -1 * process.env.STOP_LOSS_BOT) {
+                        logColor(colors.red, 'Cerrando bot en pérdidas....')
+                        if (process.env.SELL_ALL_ON_CLOSE)
+                            await _sellAll()
+                        await _closeBot()
+                        return
+                    }
                 }
+
                 _logProfits(marketPrice)
+                const entryPrice = store.get('entry_price')
+                const entryFactor = (marketPrice - entryPrice)
+                const entryPercent = parseFloat(100 * entryFactor / entryPrice).toFixed(2)
+                log(`Entry price: ${store.get('entry_price')} ${MARKET2} (${entryPercent <= 0 ? '' : '+'}${entryPercent}%)`)
                 log('===========================================================')
 
                 log(`Prev price: ${startPrice} ${MARKET2}`)
-                log(`New price: ${marketPrice} ${MARKET2}`)
 
                 if (marketPrice < startPrice) {
                     var factor = (startPrice - marketPrice)
                     var percent = parseFloat(100 * factor / startPrice).toFixed(2)
 
-                    logColor(colors.red, `Losers: -${parseFloat(percent).toFixed(3)}% ==> -${parseFloat(factor).toFixed(4)} ${MARKET2}`)
+                    logColor(colors.red,
+                        `New price: ${marketPrice} ${MARKET2} ==> -${parseFloat(percent).toFixed(3)}%`)
                     store.put('percent', `-${parseFloat(percent).toFixed(3)}`)
 
-                    if (percent >= process.env.PRICE_PERCENT)
+                    if (percent >= process.env.BUY_PERCENT)
                         await _buy(marketPrice, BUY_ORDER_AMOUNT)
                 } else {
                     const factor = (marketPrice - startPrice)
                     const percent = 100 * factor / marketPrice
 
-                    logColor(colors.green, `Gainers: +${parseFloat(percent).toFixed(3)}% ==> +${parseFloat(factor).toFixed(4)} ${MARKET2}`)
+                    logColor(colors.green,
+                        `New price: ${marketPrice} ${MARKET2} ==> +${parseFloat(percent).toFixed(3)}%`)
                     store.put('percent', `+${parseFloat(percent).toFixed(3)}`)
 
-                    await _sell(marketPrice)
+                    const toSold = getToSold(marketPrice)
+                    if (toSold.length === 0)
+                        store.put('start_price', marketPrice)
                 }
+
+                await _sell(marketPrice)
 
                 const orders = store.get('orders')
                 if (orders.length > 0) {
@@ -324,7 +413,15 @@ async function broadcast() {
                     console.log('==========================')
                     log(`Buy price: ${bOrder.buy_price} ${MARKET2}`)
                     log(`Sell price: ${bOrder.sell_price} ${MARKET2}`)
-                    log(`Order amount: ${BUY_ORDER_AMOUNT} ${MARKET2}`)
+
+                    if (process.env.USE_STOP_LOSS_GRID) {
+                        const slStrategy = process.env.STOP_LOSS_GRID_IS_FIFO ? 'FIFO' : 'LIFO'
+                        log(`SL price: ${bOrder.sl_price} ${MARKET2}, Strategy: ${slStrategy}`)
+                        log(`SL losses: ${parseFloat(store.get('sl_losses')).toFixed(3)}, Trigger price down: ${process.env.STOP_LOSS_GRID}%`)
+                    }
+
+                    log(`Order amount: ${BUY_ORDER_AMOUNT} ${MARKET2} ==> ${bOrder.amount} ${MARKET1}`)
+
                     const expectedProfits = parseFloat((bOrder.amount * bOrder.sell_price - bOrder.amount * bOrder.buy_price) - bOrder.buy_fee).toFixed(3)
                     if (expectedProfits >= 0)
                         logColor(colors.green, `Expected profit: +${expectedProfits} ${MARKET2}`)
@@ -374,6 +471,26 @@ async function getMinBuy() {
     return parseFloat(minNotional)
 }
 
+async function withdraw(profits, price) {
+    await _sellAll()
+    console.log('Procesando retiro...')
+    await sleep(process.env.SLEEP_TIME * 2)
+
+    await client.withdraw({
+        coin: MARKET2,
+        network: process.env.DEFAULT_WITHDRAW_NETWORK,
+        address: MARKET2 === 'BUSD'
+            ? process.env.WITHDRAW_ADDRESS_BUSD
+            : process.env.WITHDRAW_ADDRESS_USDT,
+        amount: profits,
+    })
+
+    store.put('withdrawal_profits', parseFloat(store.get('withdrawal_profits')) + profits)
+    console.log('Cerrando bot...')
+    await sleep(process.env.SLEEP_TIME * 2)
+    _notifyTelegram(price, 'withdraw')
+}
+
 async function init() {
     const minBuy = await getMinBuy()
     if (minBuy > BUY_ORDER_AMOUNT) {
@@ -391,8 +508,11 @@ async function init() {
         store.put('start_price', price)
         store.put('orders', [])
         store.put('profits', 0)
+        store.put('sl_losses', 0)
+        store.put('withdrawal_profits', 0)
         store.put('fees', 0)
         const balances = await getBalances()
+        store.put('entry_price', price)
         store.put(`${MARKET1.toLowerCase()}_balance`, balances[MARKET1])
         store.put(`${MARKET2.toLowerCase()}_balance`, balances[MARKET2])
         store.put(`initial_${MARKET1.toLowerCase()}_balance`, store.get(`${MARKET1.toLowerCase()}_balance`))
