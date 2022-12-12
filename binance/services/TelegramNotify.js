@@ -18,9 +18,7 @@ __Profits:__ ${parseFloat(data.realProfits).toFixed(2)} ${data.market2} ${data.m
 
     try {
         await axios.get(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_ID}/sendMessage?chat_id=${process.env.TELEGRAM_CHAT_ID}&parse_mode=MarkdownV2&text=${content}`)
-    } catch (err) {
-        console.log(err)
-    }
+    } catch (err) { }
 }
 
 module.exports = {
