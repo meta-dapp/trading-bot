@@ -112,7 +112,7 @@ async function _buy(price, amount) {
             order.status = 'bought'
             order.id = res.orderId
             order.buy_fee = parseFloat((await getFees(res.fills[0])))
-            order.amount = res.fills[0].qty - res.fills[0].commission
+            order.amount = res.executedQty - res.fills[0].commission
             store.put('fees', parseFloat(store.get('fees')) + order.buy_fee)
             order.buy_price = parseFloat(res.fills[0].price)
 
