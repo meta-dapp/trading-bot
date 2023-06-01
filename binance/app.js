@@ -466,7 +466,7 @@ const getQuantity = async (amount) => {
 
 async function getMinBuy() {
     const { symbols } = await client.exchangeInfo({ symbol: MARKET })
-    const { minNotional } = symbols[0].filters.find(filter => filter.filterType === 'MIN_NOTIONAL')
+    const { minNotional } = symbols[0].filters.find(filter => filter.filterType === 'NOTIONAL')
 
     return parseFloat(minNotional)
 }
